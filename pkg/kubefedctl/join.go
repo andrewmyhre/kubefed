@@ -20,6 +20,7 @@ import (
 	"context"
 	goerrors "errors"
 	"io"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ import (
 	apiextv1b1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kubeclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -217,7 +219,7 @@ func JoinCluster(hostConfig, clusterConfig *rest.Config, kubefedNamespace,
 	}
 
 	klog.V(2).Infof("Performing preflight checks.")
-	err = performPreflightChecks(clusterClientset, joiningClusterName, hostClusterName, kubefedNamespace, errorOnExisting)
+	err = performPreflightChecks(clusterClientset, hostClientset, client, clusterConfig, joiningClusterName, hostClusterName, kubefedNamespace, secretName, errorOnExisting)
 	if err != nil {
 		return err
 	}
@@ -260,8 +262,8 @@ func JoinCluster(hostConfig, clusterConfig *rest.Config, kubefedNamespace,
 
 // performPreflightChecks checks that the host and joining clusters are in
 // a consistent state.
-func performPreflightChecks(clusterClientset kubeclient.Interface, name, hostClusterName,
-	kubefedNamespace string, errorOnExisting bool) error {
+func performPreflightChecks(clusterClientset kubeclient.Interface, hostClientset kubeclient.Interface, genericClient genericclient.Client, joiningClusterClient *rest.Config, name, hostClusterName,
+	kubefedNamespace, secretName string, errorOnExisting bool) error {
 	// Make sure there is no existing service account in the joining cluster.
 	saName := util.ClusterServiceAccountName(name, hostClusterName)
 	_, err := clusterClientset.CoreV1().ServiceAccounts(kubefedNamespace).Get(saName,
@@ -269,15 +271,59 @@ func performPreflightChecks(clusterClientset kubeclient.Interface, name, hostClu
 
 	switch {
 	case apierrors.IsNotFound(err):
-		return nil
+		klog.V(4).Infof("Service account %s will be created in joining cluster %s", saName, name)
 	case err != nil:
 		return err
 	case errorOnExisting:
 		return errors.Errorf("service account: %s already exists in joining cluster: %s", saName, name)
 	default:
 		klog.V(2).Infof("Service account %s already exists in joining cluster %s", saName, name)
-		return nil
 	}
+
+	if secretName != "" {
+		_, err = hostClientset.CoreV1().Secrets(kubefedNamespace).Get(secretName, metav1.GetOptions{})
+	}
+
+	switch {
+	case apierrors.IsNotFound(err):
+		klog.V(4).Infof("Secret %s will be created in host cluster %s", secretName, hostClusterName)
+	case err != nil:
+		return err
+	case errorOnExisting:
+		return errors.Errorf("secret: %s already exists in host cluster %s", secretName, hostClusterName)
+	default:
+		// look up existing kubefed cluster resource in host cluster
+		existingFedCluster := &fedv1b1.KubeFedCluster{}
+		err := genericClient.Get(context.TODO(), existingFedCluster, kubefedNamespace, name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Errorf("Cluster secret %s exists in host cluster %s but no such kubefedcluster %s exists", secretName, hostClusterName, name)
+			}
+			return errors.Errorf("Looking up existing cluster %s: %v", name, err)
+		}
+
+		hasCA := len(joiningClusterClient.CAFile) != 0 || len(joiningClusterClient.CAData) != 0
+		hasCert := len(joiningClusterClient.CertFile) != 0 || len(joiningClusterClient.CertData) != 0
+		defaultTLS := hasCA || hasCert || joiningClusterClient.Insecure
+		host := joiningClusterClient.Host
+		if host == "" {
+			host = "localhost"
+		}
+
+		var joiningClusterApiEndpoint *url.URL
+		if joiningClusterClient.GroupVersion != nil {
+			joiningClusterApiEndpoint, _, err = rest.DefaultServerURL(host, joiningClusterClient.APIPath, *joiningClusterClient.GroupVersion, defaultTLS)
+		} else {
+			joiningClusterApiEndpoint, _, err = rest.DefaultServerURL(host, joiningClusterClient.APIPath, kubeschema.GroupVersion{}, defaultTLS)
+		}
+
+		if existingFedCluster.Spec.APIEndpoint != joiningClusterApiEndpoint.String() {
+			return errors.Errorf("Cluster secret %s exists in host cluster %s but existing kubefedcluster control plane %s does not match joining cluster controlplane %s", secretName, hostClusterName, existingFedCluster.Spec.APIEndpoint, joiningClusterApiEndpoint.String())
+		}
+		klog.V(2).Infof("Secret %s already exists in joining cluster %s", secretName, name)
+	}
+
+	return nil
 }
 
 // createKubeFedCluster creates a federated cluster resource that associates
@@ -423,7 +469,7 @@ func createRBACSecret(hostClusterClientset, joiningClusterClientset kubeclient.I
 	klog.V(2).Infof("Creating secret in host cluster: %s", hostClusterName)
 
 	secret, caBundle, err := populateSecretInHostCluster(joiningClusterClientset, hostClusterClientset,
-		saName, namespace, joiningClusterName, secretName, dryRun)
+		saName, namespace, joiningClusterName, secretName, dryRun, errorOnExisting)
 	if err != nil {
 		klog.V(2).Infof("Error creating secret in host cluster: %s due to: %v", hostClusterName, err)
 		return nil, nil, err
@@ -784,7 +830,7 @@ func createHealthCheckClusterRoleAndBinding(clientset kubeclient.Interface, saNa
 // namespace.
 func populateSecretInHostCluster(clusterClientset, hostClientset kubeclient.Interface,
 	saName, namespace, joiningClusterName, secretName string,
-	dryRun bool) (*corev1.Secret, []byte, error) {
+	dryRun, errorOnExisting bool) (*corev1.Secret, []byte, error) {
 	if dryRun {
 		dryRunSecret := &corev1.Secret{}
 		dryRunSecret.Name = secretName
@@ -827,7 +873,7 @@ func populateSecretInHostCluster(clusterClientset, hostClientset kubeclient.Inte
 	}
 
 	// Create a secret in the host cluster containing the token.
-	v1Secret := corev1.Secret{
+	v1Secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 		},
@@ -842,16 +888,31 @@ func populateSecretInHostCluster(clusterClientset, hostClientset kubeclient.Inte
 		v1Secret.Name = secretName
 	}
 
-	v1SecretResult, err := hostClientset.CoreV1().Secrets(namespace).Create(&v1Secret)
+	v1SecretResult, err := hostClientset.CoreV1().Secrets(namespace).Create(v1Secret)
 	if err != nil {
-		klog.V(2).Infof("Could not create secret in host cluster: %v", err)
-		return nil, nil, err
+		if apierrors.IsAlreadyExists(err) {
+			if errorOnExisting {
+				klog.V(2).Infof("Could not create secret in host cluster: %v", err)
+				return nil, nil, err
+			} else {
+				v1SecretResult, err = hostClientset.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
+				if err != nil {
+					klog.V(2).Infof("Couldn't look up existing secret %s", secretName)
+					return nil, nil, err
+				}
+				klog.V(2).Infof("Using existing secret %s in host cluster", v1SecretResult.Name)
+			}
+		} else {
+			klog.V(2).Infof("Could not create secret in host cluster: %v", err)
+			return nil, nil, err
+		}
+	} else {
+		klog.V(2).Infof("Created secret in host cluster named: %s", v1SecretResult.Name)
 	}
 
 	// caBundle is optional so no error is suggested if it is not
 	// found in the secret.
 	caBundle := secret.Data["ca.crt"]
 
-	klog.V(2).Infof("Created secret in host cluster named: %s", v1SecretResult.Name)
 	return v1SecretResult, caBundle, nil
 }
